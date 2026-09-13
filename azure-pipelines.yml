@@ -1,0 +1,188 @@
+# ============================================================================
+# Azure Pipelines Configuration for Fallout Build
+# ============================================================================
+#
+# Build Architecture:
+#   - Build Logic: All build logic is in Fallout (build/Build.cs)
+#   - CI/CD Orchestration: This YAML handles pipeline triggers and artifact publishing
+#   - Base Class: All DefaultBuilds inherit from AzurePipelinesBuild
+#
+# Fallout Targets (defined in build/Build.cs and DefaultBuilds):
+#   - ReleasePackage: Compile → Test → Package → Push to NuGet feed
+#   - ReleaseVelopack: Compile → Test → Build Velopack → Upload to Azure Blob
+#   - TagRelease: Tag and push git release (auto-triggered on main branch)
+#
+# ============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+      - bugfix/*
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - '**/*'
+    exclude:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+
+name: 1.0.$(Rev:r)
+
+# ============================================================================
+# Variables
+# ============================================================================
+variables:
+  - group: Secrets # Contains the blob SAS token for Velopack uploads
+  - name: System.Debug
+    value: 'false'
+
+# ============================================================================
+# Build Stage
+# ============================================================================
+stages:
+  - stage: Build
+    displayName: 'Build, Test, and Package'
+    jobs:
+      - job: BuildJob
+        displayName: 'Fallout Build'
+        pool:
+          name: 'Self-hosted'
+
+        steps:
+          # ----------------------------------------------------------------
+          # Setup: Checkout code with full history for GitVersion
+          # ----------------------------------------------------------------
+          - checkout: self
+            displayName: 'Checkout Repository'
+            persistCredentials: true  # Allows 'git push' for TagRelease target
+            fetchDepth: 0            # Full history required for GitVersion
+            clean: true
+
+          # ----------------------------------------------------------------
+          # Setup: Install .NET SDK
+          # ----------------------------------------------------------------
+          # The version comes from global.json so the agent installs exactly the SDK the
+          # repository is pinned to - a literal here would drift from the pin.
+          - task: UseDotNet@2
+            displayName: 'Install the .NET SDK pinned in global.json'
+            inputs:
+              useGlobalJson: true
+
+          # ----------------------------------------------------------------
+          # Setup: Authenticate to Azure Artifacts Feeds
+          # ----------------------------------------------------------------
+          - task: NuGetAuthenticate@1
+            displayName: 'Authenticate to Azure Artifacts'
+
+          # ----------------------------------------------------------------
+          # Build: Run Fallout Build (uses default target from Build.cs)
+          # Default target is ReleasePackage, which performs:
+          #   1. ShowVersion → Clean → Restore → Compile
+          #   2. ScanSecrets → UnitTests → IntegrationTests → CoverageReport
+          #   3. UpdateChangelog → Package → ReleasePackage (push to feed)
+          #   4. TagRelease (if main branch)
+          # ----------------------------------------------------------------
+          # ----------------------------------------------------------------
+          # Setup: Resolve the blob SAS token from the 'Secrets' variable group.
+          #
+          # Azure DevOps leaves a macro like $(Foo) as literal text when Foo is not
+          # defined, so a wrong variable name reaches vpk as the string "$(Foo)" and
+          # surfaces as an opaque 401 NoAuthenticationInformation. This step accepts
+          # either name and fails fast with a readable message when neither resolves.
+          # Neither the token nor its length is ever printed.
+          # ----------------------------------------------------------------
+          - powershell: |
+              $candidates = [ordered]@{
+                'AzureBlobToken'    = $env:CANDIDATE_AZUREBLOBTOKEN
+                'AzureBlobSasToken' = $env:CANDIDATE_AZUREBLOBSASTOKEN
+              }
+
+              $resolvedName = $null
+              foreach ($entry in $candidates.GetEnumerator()) {
+                $value = $entry.Value
+                # Unexpanded macros come through verbatim as "$(Name)".
+                if (-not [string]::IsNullOrWhiteSpace($value) -and $value -notmatch '^\$\(.*\)$') {
+                  $resolvedName = $entry.Key
+                  $resolvedValue = $value
+                  break
+                }
+              }
+
+              if (-not $resolvedName) {
+                # Kept out of the message interpolation: Azure DevOps expands $(...) macros
+                # across the YAML before PowerShell runs, so avoid subexpressions here.
+                $tried = $candidates.Keys -join ', '
+                Write-Host "##vso[task.logissue type=error]No blob SAS token found in the linked variable group(s)."
+                Write-Host "##vso[task.logissue type=error]Tried: $tried."
+                Write-Host "##vso[task.logissue type=error]Check Pipelines > Library > Secrets for the actual variable name, and that the group is authorized for this pipeline."
+                exit 1
+              }
+
+              Write-Host "Resolved blob SAS token from variable '$resolvedName'."
+              Write-Host "##vso[task.setvariable variable=ResolvedAzureBlobSas;issecret=true]$resolvedValue"
+            displayName: 'Resolve Azure Blob SAS Token'
+            env:
+              CANDIDATE_AZUREBLOBTOKEN: $(AzureBlobToken)
+              CANDIDATE_AZUREBLOBSASTOKEN: $(AzureBlobSasToken)
+
+          # Fallout's Velopack targets read AzureBlobSasTokenLocal, which falls back to
+          # AZURE_BLOB_SAS_TOKEN_LOCAL, so it is mapped through env: rather than passed on
+          # the command line (secrets on a command line show up in process listings).
+          - script: |
+              dotnet tool restore
+              dotnet run --project .\build\_build.csproj -- --artifacts-directory-param "$(Build.ArtifactStagingDirectory)"
+            displayName: 'Execute Fallout Build'
+            workingDirectory: $(Build.SourcesDirectory)
+            env:
+              AZURE_BLOB_SAS_TOKEN_LOCAL: $(ResolvedAzureBlobSas)
+              AZUREBLOBSASTOKEN: $(ResolvedAzureBlobSas)
+
+          # ----------------------------------------------------------------
+          # Publish: NuGet Packages
+          # ----------------------------------------------------------------
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish NuGet Packages'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/packages'
+              artifact: 'nuget-packages'
+
+          # ----------------------------------------------------------------
+          # Publish: Code Coverage Results to Azure DevOps
+          # ----------------------------------------------------------------
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Code Coverage to Azure DevOps'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(Build.ArtifactStagingDirectory)\coverage-report\Cobertura.xml'
+              reportDirectory: '$(Build.ArtifactStagingDirectory)\coverage-report'
+              failIfCoverageEmpty: false
+
+          # ----------------------------------------------------------------
+          # Publish: Coverage Report Artifact
+          # ----------------------------------------------------------------
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Coverage Report Artifact'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)\coverage-report'
+              artifact: 'coverage-report'
+
+          # ----------------------------------------------------------------
+          # Publish: Test Results to Azure DevOps
+          # ----------------------------------------------------------------
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results to Azure DevOps'
+            inputs:
+              testResultsFormat: 'VSTest'
+              testResultsFiles: '$(Build.ArtifactStagingDirectory)/test-results/**/*.trx'
+              searchFolder: '$(Build.ArtifactStagingDirectory)/test-results'
+              mergeTestResults: true
+              failTaskOnFailedTests: false
+              testRunTitle: 'Unit + Integration Tests'
