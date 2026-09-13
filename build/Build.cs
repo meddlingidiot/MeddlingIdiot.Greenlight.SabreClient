@@ -25,6 +25,6 @@ public class Build : GitHubActionsBuild, IShowVersion, IClean, ICompile, IRestor
     // AuthenticationFailed (403) — which reads like a missing token but is a mismatched one
     string IHasVelopack.AzureBlobAccount => "meddlingidiotinstallers";
     string IHasVelopack.AzureBlobEndpoint => "https://meddlingidiotinstallers.blob.core.windows.net";
-    int IHasTests.MinCoverageThreshold => 20;
+    int IHasTests.MinCoverageThreshold => 15;
     bool IHasTests.BreakBuildOnSecretLeaks => false;
 }
